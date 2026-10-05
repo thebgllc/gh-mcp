@@ -1,0 +1,9 @@
+# Secrets
+.env
+.dev.vars
+
+# Dependencies
+node_modules/
+
+# Wrangler / Cloudflare local state
+.wrangler/

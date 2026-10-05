@@ -1,0 +1,10 @@
+name = "gh-mcp"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+# Secrets (set via `wrangler secret put NAME`, do NOT put real values here):
+#   GITHUB_TOKEN  - a GitHub Personal Access Token (classic or fine-grained)
+#                   with "repo" scope (private repo read/write), plus
+#                   "project" for the Projects tools.
+#   MCP_TOKEN     - a random string you invent. Acts as the shared secret
+#                   that only you and your MCP client know, used in the URL path.
