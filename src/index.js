@@ -17,6 +17,7 @@
  */
 
 const GITHUB_API = "https://api.github.com";
+const MIN_MCP_TOKEN_LENGTH = 32;
 
 const TOOLS = [
   {
@@ -1768,7 +1769,27 @@ export default {
     if (parts[0] !== "mcp" || !parts[1]) {
       return new Response("Not found", { status: 404 });
     }
-    if (!env.MCP_TOKEN || !(await tokenMatches(parts[1], env.MCP_TOKEN))) {
+    // A short MCP_TOKEN is guessable, and it is the only thing standing between
+    // the internet and the GitHub token, so refuse to serve at all rather than
+    // serve weakly. Says why, since only the owner can fix it and nothing is exposed.
+    if (!env.MCP_TOKEN || env.MCP_TOKEN.length < MIN_MCP_TOKEN_LENGTH) {
+      return new Response(
+        `Server misconfigured: MCP_TOKEN must be set and at least ${MIN_MCP_TOKEN_LENGTH} characters. ` +
+          "Generate one with: openssl rand -hex 24",
+        { status: 503 },
+      );
+    }
+    // Rate limit before the token check, keyed by client IP, so guessing is
+    // throttled as well as use of a leaked URL. Optional: skipped when the
+    // binding isn't configured.
+    if (env.RATE_LIMITER) {
+      const key = request.headers.get("CF-Connecting-IP") || "unknown";
+      const { success } = await env.RATE_LIMITER.limit({ key });
+      if (!success) {
+        return new Response("Too many requests", { status: 429, headers: { "Retry-After": "60" } });
+      }
+    }
+    if (!(await tokenMatches(parts[1], env.MCP_TOKEN))) {
       return new Response("Not found", { status: 404 }); // 404, not 401 — don't confirm the path exists
     }
 
