@@ -6,8 +6,8 @@ Cloudflare Worker and backed by a GitHub Personal Access Token you control.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/thebgllc/gh-mcp)
 
-The button forks the repo and deploys it. You still need to set the two
-secrets afterwards (step 3 of [Setup](#setup)) before it will answer.
+The button forks the repo and deploys it. You still need to set its secrets
+afterwards (steps 3–4 of [Setup](#setup)) before it will answer.
 
 **Why use this:** Claude's built-in GitHub connector goes through an OAuth →
 GitHub App handoff that can fail on private repos and limits what you can
@@ -145,108 +145,145 @@ Without it, the error names the missing scope.
 
 ## Security
 
-There is no OAuth here. The secret lives in the URL path itself:
+Whoever can call this server can use your GitHub token. There are two ways to
+control who that is, and you can turn on either or both:
 
-```
-https://<your-worker>.<your-subdomain>.workers.dev/mcp/<MCP_TOKEN>
-```
+- **Sign in with GitHub (OAuth) — recommended.** The connector URL is just
+  `https://<your-worker>/mcp`, which is safe to share. When an MCP client
+  connects, you approve it on a consent page and sign in with GitHub, and only
+  GitHub accounts on your `ALLOWED_GITHUB_USERS` list get through. The client
+  then holds a short-lived token it refreshes itself. Removing someone from
+  the list cuts them off on their next call.
+- **Secret URL token.** The connector URL is
+  `https://<your-worker>/mcp/<MCP_TOKEN>`, and the token in the path *is* the
+  credential. Simpler to set up (no GitHub OAuth app), but **anyone who gets
+  the URL can use your GitHub token**: treat it like a password, and never
+  paste it anywhere public or in a screenshot.
 
-That keeps setup to a single pasted URL, but it means:
+Whichever you use:
 
-- **Anyone with that exact URL can use your GitHub token**, with every
-  permission the token has. Treat the URL like a password: don't paste it
-  anywhere public, don't commit it, don't share screenshots of it.
 - **Use a fine-grained PAT, not a classic one.** A fine-grained token can be
   limited to specific repositories and to read-only access, and GitHub
   enforces that no matter who calls. A classic `repo` token reaches *every*
-  repo you can access, so a leaked URL would too. If you only want Claude to
-  read code, give the token read-only permissions and the write tools will
-  simply be refused.
+  repo you can access. If you only want Claude to read code, give the token
+  read-only permissions and the write tools will simply be refused.
 - **One owner per fine-grained token.** A fine-grained PAT covers either your
   account or one organization. If you need both, deploy this twice (different
   Worker `name` in `wrangler.toml`), one connector per owner, rather than
   falling back to a classic token.
+- **Requests are rate limited** to 120 per minute per IP, before any
+  credential is checked, which throttles guessing and bulk use of a leaked
+  credential. Tune or remove the `[[ratelimits]]` block in `wrangler.toml`.
+
+For the URL token specifically:
+
 - **Use a long random `MCP_TOKEN`**, e.g. `openssl rand -hex 24`. The server
-  refuses to run (503) if it is shorter than 32 characters. Wrong tokens get
-  a plain 404, and the comparison is constant-time.
-- **Requests are rate limited** to 120 per minute per IP, before the token is
-  checked, which throttles both guessing and bulk use of a leaked URL. Tune or
-  remove the `[[ratelimits]]` block in `wrangler.toml`.
+  refuses to serve it (503) if it is shorter than 32 characters. Wrong tokens
+  get a plain 404, and the comparison is constant-time.
 - **Keep request logging off.** If you turn on Workers Logs / observability,
   or run `wrangler tail`, the full request URL — token included — can be
   recorded, and anyone with access to your Cloudflare account can read it.
 - If you think the URL has leaked, rotate it (see
-  [Rotating the token](#rotating-the-token)). If you think the PAT itself
+  [Rotating credentials](#rotating-credentials)). If you think the PAT itself
   leaked, revoke it on GitHub as well.
 
 ## Setup
 
-1. **Create a GitHub PAT.**
-   Go to https://github.com/settings/tokens?type=beta (fine-grained) or the
-   classic token page. Grant it `repo` scope (classic) or Contents +
-   Issues + Pull requests read/write (fine-grained). Contents write also
-   covers `delete_file`.
+1. **Create a GitHub PAT** — the token the tools call GitHub with.
+   Go to https://github.com/settings/personal-access-tokens/new
+   (fine-grained). **Limit it to the repositories you actually want Claude to
+   touch**, and grant Contents + Issues + Pull requests, read/write (or
+   read-only if that's all you need). Contents write also covers
+   `delete_file`.
 
-   **Use a fine-grained token limited to the repositories you actually
-   want Claude to touch**, and read-only if that's all you need. Whoever
-   holds the connector URL can do anything the token can (see
-   [Security](#security)), so keep its reach small.
+   For the Actions/cost tools, add Actions **read**, plus account permission
+   Plan **read** (user billing) or the organization's billing read (org
+   billing). For the Projects tools, add account permission Projects **read
+   and write**.
 
-   For the Actions/cost tools, add:
-   - classic: `repo` already covers reading runs and jobs on private repos;
-     `user` covers your own billing, `read:org` + `manage_billing:organization`
-     an org's.
-   - fine-grained: Actions **read**, plus account permission Plan **read**
-     (user billing) or the organization's billing read (org billing).
-
-   For the Projects tools, add `project` (classic) or account permission
-   Projects **read and write** (fine-grained).
+   If you must use a classic token instead: `repo`, plus `user` (or
+   `read:org` + `manage_billing:organization`) for billing and `project` for
+   Projects.
 
    `get_actions_billing` reports which endpoint it used and what GitHub said
    when both are refused, so a missing scope shows up as a named error rather
    than an empty result.
 
-2. **Install deps and log in to Cloudflare** (from this project directory):
+2. **Install deps, log in to Cloudflare, and deploy** (from this project
+   directory):
    ```
    npm install
    npx wrangler login
+   npx wrangler deploy
    ```
+   This prints your Worker URL, e.g. `https://gh-mcp.<subdomain>.workers.dev`,
+   and creates the KV namespace OAuth uses. The server won't answer MCP calls
+   until the next steps are done.
 
-3. **Set secrets:**
+3. **Set the GitHub token:**
    ```
    npx wrangler secret put GITHUB_TOKEN
    # paste your PAT when prompted
+   ```
 
+4. **Choose how clients get in** (one or both):
+
+   **a. Sign in with GitHub (recommended).** Create a GitHub OAuth app at
+   https://github.com/settings/applications/new with:
+   - Homepage URL: your Worker URL
+   - Authorization callback URL: `https://gh-mcp.<subdomain>.workers.dev/callback`
+
+   Generate a client secret on the app's page, then:
+   ```
+   npx wrangler secret put GITHUB_CLIENT_ID
+   npx wrangler secret put GITHUB_CLIENT_SECRET
+   npx wrangler secret put ALLOWED_GITHUB_USERS
+   # your GitHub login, or several separated by commas: alice,bob
+   ```
+   OAuth only switches on once all three are set; with no allowlist, nobody
+   can sign in. The OAuth app only identifies who is signing in — it asks
+   GitHub for no permissions, and API calls still use your PAT.
+
+   **b. Secret URL token.**
+   ```
    npx wrangler secret put MCP_TOKEN
    # paste a long random string, e.g. output of: openssl rand -hex 24
    ```
 
-4. **Deploy:**
-   ```
-   npx wrangler deploy
-   ```
-   This prints your Worker URL, e.g. `https://gh-mcp.<subdomain>.workers.dev`.
+   Secrets take effect immediately; no redeploy needed.
 
-5. **Add to Claude:**
-   Settings → Connectors → Add custom connector →
-   `https://gh-mcp.<subdomain>.workers.dev/mcp/<your MCP_TOKEN>`
-   No OAuth Client ID/Secret needed — leave Advanced settings blank.
+5. **Add to Claude:** Settings → Connectors → Add custom connector, with the URL
+   - OAuth: `https://gh-mcp.<subdomain>.workers.dev/mcp`
+   - URL token: `https://gh-mcp.<subdomain>.workers.dev/mcp/<your MCP_TOKEN>`
+
+   Leave the OAuth Client ID/Secret under Advanced settings blank either way:
+   Claude registers itself with the server. With OAuth, Claude then opens
+   the consent page; choose **Continue with GitHub** and sign in.
 
 6. **Enable it in a conversation** via the "+" → Connectors toggle, and try
    asking Claude to read a file from one of your private repos.
 
 ## Local testing
 
+Put test values in `.dev.vars` (gitignored), e.g. `GITHUB_TOKEN=...` and
+`MCP_TOKEN=...` on separate lines, then:
+
 ```
 npx wrangler dev
 ```
-Then POST JSON-RPC to `http://localhost:8787/mcp/<MCP_TOKEN>`, e.g.:
+and POST JSON-RPC to `http://localhost:8787/mcp/<MCP_TOKEN>`:
 
 ```bash
 curl -s http://localhost:8787/mcp/<MCP_TOKEN> \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_repo","arguments":{"owner":"octocat","repo":"Hello-World"}}}' | jq
 ```
+
+To try the OAuth flow locally, create a second GitHub OAuth app whose callback
+is `http://localhost:8787/callback`, put its ID and secret plus
+`ALLOWED_GITHUB_USERS` in `.dev.vars`, and point an MCP client (e.g. the MCP
+Inspector, `npx @modelcontextprotocol/inspector`) at
+`http://localhost:8787/mcp`.
 
 ## Contributing
 
@@ -256,15 +293,21 @@ vulnerability*) rather than a public issue.
 
 ## Extending it
 
-Tools live in `src/index.js` — each is a case in `callTool()` plus an entry
+Tools live in `src/index.js` (sign-in is in `src/oauth.js`) — each is a case in `callTool()` plus an entry
 in the `TOOLS` array (JSON Schema for its arguments). To add e.g.
 `list_prs` or `get_pr_diff`, copy the shape of an existing tool and hit the
 matching GitHub REST endpoint via the `gh()` helper.
 
-## Rotating the token
+## Rotating credentials
 
-If the URL ever leaks: `npx wrangler secret put MCP_TOKEN` with a new value,
-redeploy, and update the connector URL in Claude's settings.
+- **URL token leaked:** `npx wrangler secret put MCP_TOKEN` with a new value
+  and update the connector URL in Claude's settings. The old URL stops working
+  at once. To drop the URL-token path entirely, `npx wrangler secret delete
+  MCP_TOKEN`.
+- **Someone shouldn't have OAuth access any more:** remove them from
+  `ALLOWED_GITHUB_USERS`. Their next call is refused.
+- **PAT leaked:** revoke it on GitHub, create a new one, and
+  `npx wrangler secret put GITHUB_TOKEN`.
 
 ## License
 
