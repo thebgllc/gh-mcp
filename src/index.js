@@ -2,19 +2,17 @@
  * gh-mcp — a minimal self-hosted MCP server for GitHub, backed directly by a
  * Personal Access Token instead of Anthropic's OAuth->GitHub App handoff.
  *
- * Auth model: the URL itself contains a secret path segment
- * (`/mcp/<MCP_TOKEN>`). Only someone who knows the full URL can call it.
- * This avoids needing OAuth or Claude's (currently beta/gated) custom
- * header auth. Treat the URL like a password — don't post it publicly.
+ * Two ways in, either or both:
+ *   - OAuth at /mcp: clients sign in with GitHub, and only logins on
+ *     ALLOWED_GITHUB_USERS get through. See src/oauth.js.
+ *   - URL token at /mcp/<MCP_TOKEN>: the secret is in the path. Simpler, but
+ *     anyone holding the URL is in. Treat it like a password.
  *
- * Deploy:
- *   wrangler secret put GITHUB_TOKEN   # PAT with "repo" scope
- *   wrangler secret put MCP_TOKEN      # random string you invent
- *   wrangler deploy
- *
- * Then add https://<your-worker>.workers.dev/mcp/<MCP_TOKEN> as a custom
- * connector URL in Claude.
+ * GitHub API calls use GITHUB_TOKEN (wrangler secret put GITHUB_TOKEN) either
+ * way. Setup is in the README.
  */
+
+import { MCP_PATH, oauthConfigured, oauthProvider } from "./oauth.js";
 
 const GITHUB_API = "https://api.github.com";
 const MIN_MCP_TOKEN_LENGTH = 32;
@@ -1761,27 +1759,62 @@ async function tokenMatches(given, expected) {
   return crypto.subtle.timingSafeEqual(a, b);
 }
 
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const parts = url.pathname.split("/").filter(Boolean); // ["mcp", "<token>"]
+// JSON-RPC over HTTP POST, shared by both ways in (OAuth and the URL token).
+async function handleMcp(request, env) {
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405 });
+  }
 
-    if (parts[0] !== "mcp" || !parts[1]) {
-      return new Response("Not found", { status: 404 });
-    }
-    // A short MCP_TOKEN is guessable, and it is the only thing standing between
-    // the internet and the GitHub token, so refuse to serve at all rather than
-    // serve weakly. Says why, since only the owner can fix it and nothing is exposed.
-    if (!env.MCP_TOKEN || env.MCP_TOKEN.length < MIN_MCP_TOKEN_LENGTH) {
-      return new Response(
-        `Server misconfigured: MCP_TOKEN must be set and at least ${MIN_MCP_TOKEN_LENGTH} characters. ` +
-          "Generate one with: openssl rand -hex 24",
-        { status: 503 },
-      );
-    }
-    // Rate limit before the token check, keyed by client IP, so guessing is
-    // throttled as well as use of a leaked URL. Optional: skipped when the
-    // binding isn't configured.
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response("Invalid JSON", { status: 400 });
+  }
+
+  const messages = Array.isArray(body) ? body : [body];
+  const responses = [];
+  for (const msg of messages) {
+    const result = await handleRpc(msg, env);
+    if (result) responses.push(result);
+  }
+
+  if (responses.length === 0) {
+    return new Response(null, { status: 202 }); // notification only
+  }
+
+  const payload = Array.isArray(body) ? responses : responses[0];
+  return new Response(JSON.stringify(payload), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// The original way in: /mcp/<MCP_TOKEN>, the secret in the URL path. Still
+// supported for clients that can't do OAuth, and only when MCP_TOKEN is set.
+async function handleTokenPath(request, env, token) {
+  // A short MCP_TOKEN is guessable, and it is the only thing standing between
+  // the internet and the GitHub token, so refuse to serve at all rather than
+  // serve weakly. Says why, since only the owner can fix it and nothing is exposed.
+  if (env.MCP_TOKEN.length < MIN_MCP_TOKEN_LENGTH) {
+    return new Response(
+      `Server misconfigured: MCP_TOKEN must be at least ${MIN_MCP_TOKEN_LENGTH} characters. ` +
+        "Generate one with: openssl rand -hex 24",
+      { status: 503 },
+    );
+  }
+  if (!(await tokenMatches(token, env.MCP_TOKEN))) {
+    return new Response("Not found", { status: 404 }); // 404, not 401 — don't confirm the path exists
+  }
+  return handleMcp(request, env);
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // Rate limit everything, keyed by client IP, so guessing a URL token,
+    // hammering the sign-in pages and bulk use of a leaked credential are all
+    // throttled. Optional: skipped when the binding isn't configured.
     if (env.RATE_LIMITER) {
       const key = request.headers.get("CF-Connecting-IP") || "unknown";
       const { success } = await env.RATE_LIMITER.limit({ key });
@@ -1789,35 +1822,23 @@ export default {
         return new Response("Too many requests", { status: 429, headers: { "Retry-After": "60" } });
       }
     }
-    if (!(await tokenMatches(parts[1], env.MCP_TOKEN))) {
-      return new Response("Not found", { status: 404 }); // 404, not 401 — don't confirm the path exists
+
+    const tokenPath = url.pathname.match(/^\/mcp\/([^/]+)\/?$/);
+    if (tokenPath && env.MCP_TOKEN) {
+      return handleTokenPath(request, env, tokenPath[1]);
     }
 
-    if (request.method !== "POST") {
-      return new Response("Method not allowed", { status: 405 });
+    if (oauthConfigured(env)) {
+      return oauthProvider(url.origin, handleMcp).fetch(request, env, ctx);
     }
 
-    let body;
-    try {
-      body = await request.json();
-    } catch {
-      return new Response("Invalid JSON", { status: 400 });
+    if (url.pathname === MCP_PATH || url.pathname.startsWith(MCP_PATH + "/")) {
+      return new Response(
+        "Server not configured: set up OAuth (OAUTH_KV, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, " +
+          "ALLOWED_GITHUB_USERS) or MCP_TOKEN. See the README.",
+        { status: 503 },
+      );
     }
-
-    const messages = Array.isArray(body) ? body : [body];
-    const responses = [];
-    for (const msg of messages) {
-      const result = await handleRpc(msg, env);
-      if (result) responses.push(result);
-    }
-
-    if (responses.length === 0) {
-      return new Response(null, { status: 202 }); // notification only
-    }
-
-    const payload = Array.isArray(body) ? responses : responses[0];
-    return new Response(JSON.stringify(payload), {
-      headers: { "Content-Type": "application/json" },
-    });
+    return new Response("Not found", { status: 404 });
   },
 };

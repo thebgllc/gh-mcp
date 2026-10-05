@@ -1,16 +1,28 @@
 name = "gh-mcp"
 main = "src/index.js"
 compatibility_date = "2026-07-01"
+# Lets the OAuth layer fetch MCP clients' metadata documents (CIMD) safely:
+# outbound fetches always go to the public internet.
+compatibility_flags = ["global_fetch_strictly_public"]
 
 # Secrets (set via `wrangler secret put NAME`, do NOT put real values here):
-#   GITHUB_TOKEN  - a GitHub Personal Access Token (classic or fine-grained)
-#                   with "repo" scope (private repo read/write), plus
-#                   "project" for the Projects tools.
-#   MCP_TOKEN     - a random string you invent. Acts as the shared secret
-#                   that only you and your MCP client know, used in the URL path.
+#   GITHUB_TOKEN          - GitHub PAT the tools call the API with. Prefer a
+#                           fine-grained token; see the README.
+# For OAuth sign-in at /mcp (recommended):
+#   GITHUB_CLIENT_ID      - from a GitHub OAuth app whose callback URL is
+#   GITHUB_CLIENT_SECRET    https://<your-worker>/callback
+#   ALLOWED_GITHUB_USERS  - comma-separated GitHub logins allowed to sign in
+#                           (a var or a secret; nobody gets in without it)
+# For the URL-token path /mcp/<MCP_TOKEN> (optional, simpler, weaker):
+#   MCP_TOKEN             - a random string of 32+ characters.
 
-# Per-IP rate limit on /mcp, applied before the token check. Remove this block
-# to disable it. period must be 10 or 60 (seconds).
+# OAuth clients, grants and tokens. Wrangler creates the namespace on first
+# deploy; nothing to fill in. Unused if OAuth isn't configured.
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+
+# Per-IP rate limit on every request, applied before any credential check.
+# Remove this block to disable it. period must be 10 or 60 (seconds).
 [[ratelimits]]
 name = "RATE_LIMITER"
 namespace_id = "1001"
