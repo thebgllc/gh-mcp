@@ -156,10 +156,25 @@ That keeps setup to a single pasted URL, but it means:
 - **Anyone with that exact URL can use your GitHub token**, with every
   permission the token has. Treat the URL like a password: don't paste it
   anywhere public, don't commit it, don't share screenshots of it.
-- **Scope the token tightly.** A fine-grained PAT limited to specific repos
-  and only the permissions you need caps the damage if the URL leaks.
-- **Use a long random `MCP_TOKEN`**, e.g. `openssl rand -hex 24`. Wrong
-  tokens get a plain 404, and the comparison is constant-time.
+- **Use a fine-grained PAT, not a classic one.** A fine-grained token can be
+  limited to specific repositories and to read-only access, and GitHub
+  enforces that no matter who calls. A classic `repo` token reaches *every*
+  repo you can access, so a leaked URL would too. If you only want Claude to
+  read code, give the token read-only permissions and the write tools will
+  simply be refused.
+- **One owner per fine-grained token.** A fine-grained PAT covers either your
+  account or one organization. If you need both, deploy this twice (different
+  Worker `name` in `wrangler.toml`), one connector per owner, rather than
+  falling back to a classic token.
+- **Use a long random `MCP_TOKEN`**, e.g. `openssl rand -hex 24`. The server
+  refuses to run (503) if it is shorter than 32 characters. Wrong tokens get
+  a plain 404, and the comparison is constant-time.
+- **Requests are rate limited** to 120 per minute per IP, before the token is
+  checked, which throttles both guessing and bulk use of a leaked URL. Tune or
+  remove the `[[ratelimits]]` block in `wrangler.toml`.
+- **Keep request logging off.** If you turn on Workers Logs / observability,
+  or run `wrangler tail`, the full request URL — token included — can be
+  recorded, and anyone with access to your Cloudflare account can read it.
 - If you think the URL has leaked, rotate it (see
   [Rotating the token](#rotating-the-token)). If you think the PAT itself
   leaked, revoke it on GitHub as well.
@@ -172,9 +187,10 @@ That keeps setup to a single pasted URL, but it means:
    Issues + Pull requests read/write (fine-grained). Contents write also
    covers `delete_file`.
 
-   **Prefer a fine-grained token limited to the repositories you actually
-   want Claude to touch.** Whoever holds the connector URL can do anything
-   the token can (see [Security](#security)), so keep its reach small.
+   **Use a fine-grained token limited to the repositories you actually
+   want Claude to touch**, and read-only if that's all you need. Whoever
+   holds the connector URL can do anything the token can (see
+   [Security](#security)), so keep its reach small.
 
    For the Actions/cost tools, add:
    - classic: `repo` already covers reading runs and jobs on private repos;

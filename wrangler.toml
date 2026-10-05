@@ -8,3 +8,10 @@ compatibility_date = "2026-07-01"
 #                   "project" for the Projects tools.
 #   MCP_TOKEN     - a random string you invent. Acts as the shared secret
 #                   that only you and your MCP client know, used in the URL path.
+
+# Per-IP rate limit on /mcp, applied before the token check. Remove this block
+# to disable it. period must be 10 or 60 (seconds).
+[[ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 120, period = 60 }
