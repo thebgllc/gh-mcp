@@ -422,6 +422,70 @@ const TOOLS = [
     },
   },
   {
+    name: "get_workflow_run",
+    description:
+      "Say why a GitHub Actions run failed: run metadata (workflow, event, branch, head SHA, conclusion, timings), every job with its conclusion and failed step(s), and the check-run annotations of the failed jobs (file, line, message) — usually enough to name a failing test. Identify the run by owner/repo/run_id, or just pass an Actions URL (github.com/<owner>/<repo>/actions/runs/<id>, with or without /job/<id> or /attempts/<n>) as url. Follow up with get_job_logs for a failed job's log output.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner: { type: "string", description: "Repository owner. Not needed when url is given." },
+        repo: { type: "string", description: "Repository name. Not needed when url is given." },
+        run_id: { type: "string", description: "Numeric run id, as listed by list_workflow_runs. An Actions URL works here too." },
+        url: { type: "string", description: "An Actions run or job URL, instead of owner/repo/run_id." },
+        attempt: { type: "number", description: "Run attempt to report on. Defaults to the latest attempt." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "get_job_logs",
+    description:
+      "Read the plain-text log of one GitHub Actions job. Logs run to megabytes and the useful part is at the end, so by default this returns the tail of the failed step's section (the last 150 lines, at most 50000 bytes), with timestamps and ANSI colour codes stripped. Identify the job by owner/repo/job_id (job ids come from get_workflow_run) or by an Actions job URL; given only a run (run_id or a run URL), it picks the run's failed job when there is exactly one. When the log is cut, the response includes a short-lived pre-authorized URL for the full log.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner: { type: "string", description: "Repository owner. Not needed when url is given." },
+        repo: { type: "string", description: "Repository name. Not needed when url is given." },
+        job_id: { type: "string", description: "Numeric job id, from get_workflow_run. An Actions job URL works here too." },
+        run_id: { type: "string", description: "Numeric run id, instead of job_id: uses the run's failed job if there is exactly one." },
+        url: { type: "string", description: "An Actions job URL (…/actions/runs/<run>/job/<job>) or run URL, instead of owner/repo/job_id." },
+        step: {
+          type: "string",
+          description:
+            "Which part of the log to read: 'failed' (default) for the failed step(s) only, falling back to the whole log when no step failed; 'all' for the whole job; or a step number from get_workflow_run.",
+        },
+        tail_lines: { type: "number", description: "Return this many lines from the end of the selected section. Defaults to 150." },
+        max_bytes: { type: "number", description: "Size ceiling for the returned log text; lines are dropped from the start to fit. Defaults to 50000." },
+        grep: {
+          type: "string",
+          description:
+            "Only return lines matching this case-insensitive regular expression (applied before tail_lines), e.g. 'error|✘|failed'. Each match is prefixed with its line number in the section.",
+        },
+        timestamps: { type: "boolean", description: "Keep each line's timestamp. Defaults to false." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "list_run_artifacts",
+    description:
+      "List the artifacts a GitHub Actions run uploaded (test reports, Playwright traces, build output): id, name, size, and expiry, each with a pre-authorized download URL for the zip. The URLs expire after about a minute, so fetch them straight away. Identify the run by owner/repo/run_id or an Actions URL.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner: { type: "string", description: "Repository owner. Not needed when url is given." },
+        repo: { type: "string", description: "Repository name. Not needed when url is given." },
+        run_id: { type: "string", description: "Numeric run id. An Actions URL works here too." },
+        url: { type: "string", description: "An Actions run URL, instead of owner/repo/run_id." },
+        download_urls: {
+          type: "boolean",
+          description: "Resolve a download URL per artifact (one API call each, first 10 artifacts). Defaults to true.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: "get_project",
     description:
       "Read a GitHub Project (the new Projects, v2) by owner and number: its title, URL, and every field with its type — and, for single-select fields, the option names. Call this to learn a project's field names before update_project_item_field. Works for user- and org-owned projects alike. Needs a token with the 'project' (or 'read:project') scope.",
@@ -627,6 +691,159 @@ function addByOs(totals, byOs) {
 
 function sumByOs(byOs) {
   return Object.values(byOs || {}).reduce((t, n) => t + n, 0);
+}
+
+// --- Actions run / job / log helpers ---------------------------------------
+
+// Annotations cost one API call per job, against the same subrequest budget.
+const ANNOTATION_MAX_JOBS = 15;
+const ANNOTATIONS_PER_JOB = 30;
+const ANNOTATION_MESSAGE_MAX = 1500;
+const LOG_TAIL_LINES = 150;
+const LOG_MAX_BYTES = 50_000;
+// Above this the log isn't downloaded at all, only linked: the whole text has
+// to fit in the Worker's memory to be sliced.
+const LOG_DOWNLOAD_MAX_BYTES = 25_000_000;
+const ARTIFACT_URL_MAX = 10;
+const ACTIONS_ACCESS_HINT =
+  "If the run exists, the token probably can't see it: fine-grained tokens need Actions read on this repository.";
+
+const isNumeric = (v) => /^\d+$/.test(String(v == null ? "" : v).trim());
+
+// Work out which run/job a call means. Every identifier can arrive as a plain
+// number or as an Actions URL (the kind CI failure issues link to), in any of
+// url / run_id / job_id, so a caller can paste what it has.
+function resolveActionsTarget(args) {
+  const t = { owner: args.owner, repo: args.repo, runId: null, jobId: null, attempt: null };
+  const link = [args.url, args.run_id, args.job_id].find((v) => typeof v === "string" && v.includes("/"));
+  if (link) {
+    const repo = /github\.com\/([^/\s]+)\/([^/\s?#]+)\//.exec(link);
+    const run = /\/actions\/runs\/(\d+)/.exec(link);
+    const job = /\/jobs?\/(\d+)/.exec(link) || (run ? null : /\/runs\/(\d+)/.exec(link)); // …/runs/<id> is a check run, i.e. a job
+    const attempt = /\/attempts\/(\d+)/.exec(link);
+    if (!repo || (!run && !job)) {
+      throw new Error(
+        `Can't read a run or job out of '${link}'. Expected something like ` +
+          `https://github.com/<owner>/<repo>/actions/runs/<run id> or …/actions/runs/<run id>/job/<job id>.`,
+      );
+    }
+    t.owner = repo[1];
+    t.repo = repo[2];
+    if (run) t.runId = run[1];
+    if (job) t.jobId = job[1];
+    if (attempt) t.attempt = attempt[1];
+  }
+  if (isNumeric(args.run_id)) t.runId = String(args.run_id).trim();
+  if (isNumeric(args.job_id)) t.jobId = String(args.job_id).trim();
+  if (isNumeric(args.attempt)) t.attempt = String(args.attempt).trim();
+  if (!t.owner || !t.repo) throw new Error("Pass owner and repo, or an Actions URL as url.");
+  return t;
+}
+
+const jobFailed = (j) => j.conclusion === "failure" || j.conclusion === "timed_out";
+const stepFailed = (s) => s.conclusion === "failure" || s.conclusion === "timed_out";
+
+function elapsed(from, to) {
+  if (!from || !to) return null;
+  const ms = new Date(to) - new Date(from);
+  return ms >= 0 ? formatDuration(ms) : null;
+}
+
+function indent(text, pad) {
+  return String(text).split("\n").join(`\n${pad}`);
+}
+
+// GitHub answers log and artifact downloads with a 302 to a short-lived signed
+// URL. The redirect is taken by hand: the signed URL is what we hand back when
+// the payload is too big to inline, and it must be fetched without our
+// Authorization header (the storage host rejects a request carrying both).
+async function ghRedirectUrl(env, path) {
+  const res = await fetch(`${GITHUB_API}${path}`, {
+    redirect: "manual",
+    headers: {
+      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "gh-mcp-worker",
+    },
+  });
+  const location = res.headers.get("Location");
+  if (res.status >= 300 && res.status < 400 && location) return location;
+  const text = await res.text();
+  let msg = `GitHub API error ${res.status}`;
+  try {
+    msg = JSON.parse(text).message || msg;
+  } catch {
+    // not JSON — keep the status line
+  }
+  const err = new Error(`${res.status} ${msg}`);
+  err.status = res.status;
+  throw err;
+}
+
+const LOG_TIMESTAMP = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z) ?/;
+const ANSI_CODES = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+
+const STEP_HEADER = /^##\[group\]Run /;
+const isStepHeader = (line) => STEP_HEADER.test(line.replace(LOG_TIMESTAMP, ""));
+
+// Cut a job log down to the lines one step wrote. Every line is timestamped
+// and each step reports when it started and finished, but only to the whole
+// second, and steps after a failure often all run inside the second it ended
+// in. So the time window only narrows the search; the step's own boundaries are
+// its '##[group]Run …' header and the next step's.
+// Runner-internal steps write no '##[group]Run' header.
+const HEADERLESS_STEP = /^(Set up job|Complete job|Post )/;
+const secondOf = (iso) => Math.floor(new Date(iso).getTime() / 1000) * 1000;
+
+function sliceLogToStep(lines, step, allSteps) {
+  const from = secondOf(step.started_at);
+  const to = Math.floor(new Date(step.completed_at).getTime() / 1000) * 1000 + 1000;
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return [];
+  const window = [];
+  let inside = false;
+  for (const line of lines) {
+    const m = LOG_TIMESTAMP.exec(line);
+    // A line without a timestamp continues the one before it.
+    if (m) {
+      const at = new Date(m[1]).getTime();
+      inside = at >= from && at < to;
+    }
+    if (inside) window.push(line);
+  }
+  // The window opens in the second the previous step ended, so it can start
+  // with that step's tail. Begin at this step's header when one is near the
+  // top (in the first second), and end before the next header.
+  const firstSecond = window.findIndex((l) => {
+    const m = LOG_TIMESTAMP.exec(l);
+    return m && new Date(m[1]).getTime() >= from + 1000;
+  });
+  const searchTo = firstSecond === -1 ? window.length : firstSecond;
+  // Steps that ran before this one but started in the same second put their
+  // headers there first, so this step's header is the one after theirs.
+  const before = allSteps.filter(
+    (s) =>
+      s.number < step.number &&
+      s.conclusion !== "skipped" &&
+      !HEADERLESS_STEP.test(s.name) &&
+      s.started_at &&
+      secondOf(s.started_at) === from,
+  ).length;
+  const headers = [];
+  for (let i = 0; i < searchTo; i++) if (isStepHeader(window[i])) headers.push(i);
+  const start = headers.length ? headers[Math.min(before, headers.length - 1)] : 0;
+  let end = window.length;
+  for (let i = start + 1; i < window.length; i++) {
+    if (isStepHeader(window[i])) {
+      end = i;
+      break;
+    }
+  }
+  return window.slice(start, end);
+}
+
+function sliceLogToSteps(lines, steps, allSteps) {
+  return steps.flatMap((s) => sliceLogToStep(lines, s, allSteps));
 }
 
 async function gh(env, path, options = {}) {
@@ -1589,6 +1806,320 @@ async function callTool(name, args, env) {
             `or the account is a personal account rather than an organization — in that case call this without account_type='org'.`,
         );
       }
+    }
+
+    case "get_workflow_run": {
+      const t = resolveActionsTarget(args);
+      const { owner, repo } = t;
+      if (!t.runId && t.jobId) {
+        const job = await gh(env, `/repos/${owner}/${repo}/actions/jobs/${t.jobId}`);
+        t.runId = String(job.run_id);
+        if (!t.attempt && job.run_attempt) t.attempt = String(job.run_attempt);
+      }
+      if (!t.runId) throw new Error("Pass run_id (from list_workflow_runs) or an Actions run URL as url.");
+
+      const runPath = `/repos/${owner}/${repo}/actions/runs/${t.runId}`;
+      let run;
+      try {
+        run = await gh(env, t.attempt ? `${runPath}/attempts/${t.attempt}` : runPath);
+      } catch (err) {
+        if (err.status === 404) {
+          throw new Error(
+            `No run ${t.runId}${t.attempt ? ` attempt ${t.attempt}` : ""} in ${owner}/${repo} (404). ${ACTIONS_ACCESS_HINT}`,
+          );
+        }
+        throw err;
+      }
+      const jobsData = await gh(
+        env,
+        t.attempt ? `${runPath}/attempts/${t.attempt}/jobs?per_page=100` : `${runPath}/jobs?per_page=100&filter=latest`,
+      );
+      const jobs = jobsData.jobs || [];
+
+      // Failures first, then cancellations (which can carry the reason a
+      // fail-fast matrix stopped), up to the budget.
+      const wantAnnotations = [...jobs.filter(jobFailed), ...jobs.filter((j) => j.conclusion === "cancelled")].slice(
+        0,
+        ANNOTATION_MAX_JOBS,
+      );
+      const annotations = new Map();
+      await Promise.all(
+        wantAnnotations.map(async (j) => {
+          try {
+            annotations.set(
+              j.id,
+              await gh(env, `/repos/${owner}/${repo}/check-runs/${j.id}/annotations?per_page=${ANNOTATIONS_PER_JOB}`),
+            );
+          } catch (err) {
+            annotations.set(j.id, err);
+          }
+        }),
+      );
+
+      const started = run.run_started_at || run.created_at;
+      const took = run.status === "completed" ? elapsed(started, run.updated_at) : null;
+      const commitTitle = run.head_commit && run.head_commit.message ? run.head_commit.message.split("\n")[0] : "";
+      let out =
+        `${run.name} #${run.run_number} — run ${run.id}, attempt ${run.run_attempt} ` +
+        `[${run.status}${run.conclusion ? `/${run.conclusion}` : ""}]\n` +
+        `${run.html_url}\n` +
+        `${run.event} on ${run.head_branch} @ ${String(run.head_sha || "").slice(0, 7)}${commitTitle ? ` "${commitTitle}"` : ""}\n` +
+        `Head SHA: ${run.head_sha}\n` +
+        `Workflow: ${run.path}\n` +
+        `Started ${started}${took ? `, took ${took}` : " (still running)"}` +
+        `${run.triggering_actor ? `, triggered by ${run.triggering_actor.login}` : ""}\n`;
+      if (run.run_attempt > 1 && !t.attempt) {
+        out += `This is attempt ${run.run_attempt}; pass attempt=1..${run.run_attempt - 1} for an earlier one.\n`;
+      }
+
+      const failedJobs = jobs.filter(jobFailed);
+      out += `\n${jobs.length} job(s)${jobs.length ? `, ${failedJobs.length} failed` : ""}:\n`;
+      if (!jobs.length) {
+        out +=
+          "(none — a run with no jobs usually failed before starting: an invalid workflow file, or a startup failure. Open the run URL above.)\n";
+      }
+      let unreadable = null;
+      for (const j of jobs) {
+        const jobTook = elapsed(j.started_at, j.completed_at);
+        out += `\n[${j.conclusion || j.status}] ${j.name} — job ${j.id}${jobTook ? ` — ${jobTook}` : ""}\n`;
+        const steps = j.steps || [];
+        const notable = steps.filter((s) => stepFailed(s) || s.status === "in_progress");
+        for (const s of notable) {
+          const stepTook = elapsed(s.started_at, s.completed_at);
+          out += `    step ${s.number} "${s.name}" [${s.conclusion || s.status}]${stepTook ? ` ${stepTook}` : ""}\n`;
+        }
+        if (jobFailed(j) && !notable.length) {
+          out += `    (no failed step reported — the job died outside its steps, e.g. the runner was lost or setup failed)\n`;
+        }
+        const ann = annotations.get(j.id);
+        if (ann instanceof Error) {
+          unreadable = ann;
+          out += `    annotations: (unavailable — ${ann.message})\n`;
+        } else if (ann && ann.length) {
+          for (const a of ann) {
+            const where = a.path && a.path !== ".github" ? `${a.path}:${a.start_line}` : "";
+            let message = [a.title, a.message].filter(Boolean).join(": ").replace(ANSI_CODES, "").trim();
+            if (message.length > ANNOTATION_MESSAGE_MAX) message = `${message.slice(0, ANNOTATION_MESSAGE_MAX)}… [cut]`;
+            out += `    ${a.annotation_level}${where ? ` ${where}` : ""} — ${indent(message, "        ")}\n`;
+          }
+          if (ann.length >= ANNOTATIONS_PER_JOB) out += `    (first ${ANNOTATIONS_PER_JOB} annotations shown)\n`;
+        } else if (ann) {
+          out += `    (no annotations)\n`;
+        }
+      }
+
+      const notes = [];
+      if ((jobsData.total_count || jobs.length) > jobs.length) {
+        notes.push(`Only the first ${jobs.length} of ${jobsData.total_count} jobs are listed.`);
+      }
+      if (failedJobs.length + jobs.filter((j) => j.conclusion === "cancelled").length > wantAnnotations.length) {
+        notes.push(`Annotations were read for the first ${ANNOTATION_MAX_JOBS} failed/cancelled jobs only.`);
+      }
+      if (unreadable && (unreadable.status === 403 || unreadable.status === 404)) {
+        notes.push("Annotations need Checks read on the token (classic tokens: repo). get_job_logs works without it.");
+      }
+      if (failedJobs.length) {
+        notes.push(
+          `For a failed job's output: get_job_logs {owner: "${owner}", repo: "${repo}", job_id: "${failedJobs[0].id}"}.`,
+        );
+      }
+      return out + (notes.length ? `\n${notes.join("\n")}` : "");
+    }
+
+    case "get_job_logs": {
+      const t = resolveActionsTarget(args);
+      const { owner, repo } = t;
+      const want = String(args.step == null || args.step === "" ? "failed" : args.step).toLowerCase();
+      if (want !== "failed" && want !== "all" && !isNumeric(want)) {
+        throw new Error("step must be 'failed', 'all', or a step number.");
+      }
+      const tailLines = Math.max(1, Math.floor(Number(args.tail_lines) || LOG_TAIL_LINES));
+      const maxBytes = Math.max(1000, Math.floor(Number(args.max_bytes) || LOG_MAX_BYTES));
+      let pattern = null;
+      if (args.grep) {
+        try {
+          pattern = new RegExp(String(args.grep), "i");
+        } catch (err) {
+          throw new Error(`grep is not a valid regular expression: ${err.message}`);
+        }
+      }
+
+      // A run was named but no job: fine when only one job failed.
+      if (!t.jobId) {
+        if (!t.runId) throw new Error("Pass job_id (from get_workflow_run), or an Actions job URL as url.");
+        const runPath = `/repos/${owner}/${repo}/actions/runs/${t.runId}`;
+        const data = await gh(
+          env,
+          t.attempt ? `${runPath}/attempts/${t.attempt}/jobs?per_page=100` : `${runPath}/jobs?per_page=100&filter=latest`,
+        );
+        const all = data.jobs || [];
+        const failed = all.filter(jobFailed);
+        const pick = failed.length === 1 ? failed[0] : all.length === 1 ? all[0] : null;
+        if (!pick) {
+          throw new Error(
+            `Run ${t.runId} has ${all.length} job(s), ${failed.length} failed — pass the job_id of the one you want:\n` +
+              ((failed.length ? failed : all).map((j) => `  ${j.id} ${j.name} [${j.conclusion || j.status}]`).join("\n") ||
+                "  (no jobs)"),
+          );
+        }
+        t.jobId = String(pick.id);
+      }
+
+      let job;
+      try {
+        job = await gh(env, `/repos/${owner}/${repo}/actions/jobs/${t.jobId}`);
+      } catch (err) {
+        if (err.status === 404) throw new Error(`No job ${t.jobId} in ${owner}/${repo} (404). ${ACTIONS_ACCESS_HINT}`);
+        throw err;
+      }
+      const steps = job.steps || [];
+      const failedSteps = steps.filter(stepFailed);
+      let header =
+        `${job.name} — job ${job.id} of run ${job.run_id} [${job.conclusion || job.status}]\n${job.html_url}\n` +
+        (failedSteps.length
+          ? `Failed step(s): ${failedSteps.map((s) => `${s.number} "${s.name}"`).join(", ")}\n`
+          : "");
+
+      let logUrl;
+      try {
+        logUrl = await ghRedirectUrl(env, `/repos/${owner}/${repo}/actions/jobs/${t.jobId}/logs`);
+      } catch (err) {
+        if (err.status === 404 || err.status === 410) {
+          return (
+            header +
+            `\n(No log to read: GitHub answered ${err.message}. ` +
+            (job.status !== "completed"
+              ? `The job is ${job.status} — its log is only served once it finishes.)`
+              : `Logs are deleted after the repository's retention period, and a job that never started has none.)`)
+          );
+        }
+        throw err;
+      }
+
+      const res = await fetch(logUrl);
+      if (!res.ok) throw new Error(`Downloading the log failed: ${res.status} from the log store.`);
+      const declared = Number(res.headers.get("Content-Length")) || 0;
+      if (declared > LOG_DOWNLOAD_MAX_BYTES) {
+        if (res.body) await res.body.cancel();
+        return (
+          header +
+          `\n(Not read: the log is ${declared} bytes, over the ${LOG_DOWNLOAD_MAX_BYTES}-byte limit for slicing it here. ` +
+          `Download it directly — this URL is pre-authorized and expires in about a minute:)\n${logUrl}`
+        );
+      }
+      const raw = (await res.text()).replace(/^\uFEFF/, "");
+      const allLines = raw.split(/\r?\n/);
+      if (allLines.length && allLines[allLines.length - 1] === "") allLines.pop();
+
+      let section = allLines;
+      let sectionName = "whole job";
+      if (want !== "all") {
+        const chosen = want === "failed" ? failedSteps : steps.filter((s) => String(s.number) === want);
+        if (want !== "failed" && !chosen.length) {
+          throw new Error(
+            `Job ${job.id} has no step ${want}. Steps: ${steps.map((s) => `${s.number} "${s.name}"`).join(", ") || "(none)"}.`,
+          );
+        }
+        if (chosen.length) {
+          const sliced = sliceLogToSteps(allLines, chosen, steps);
+          const names = chosen.map((s) => `${s.number} "${s.name}"`).join(", ");
+          if (sliced.length) {
+            section = sliced;
+            sectionName = `step ${names}`;
+          } else {
+            sectionName = `whole job (no log lines fall inside step ${names})`;
+          }
+        } else {
+          sectionName = "whole job (no failed step)";
+        }
+      }
+
+      let lines = section.map((l, i) => {
+        const clean = (args.timestamps ? l : l.replace(LOG_TIMESTAMP, "")).replace(ANSI_CODES, "");
+        return pattern ? { n: i + 1, text: clean } : clean;
+      });
+      let matched = null;
+      if (pattern) {
+        lines = lines.filter((l) => pattern.test(l.text)).map((l) => `${l.n}: ${l.text}`);
+        matched = lines.length;
+      }
+      const candidates = lines.length;
+      lines = lines.slice(-tailLines);
+      // Fit the byte ceiling by dropping from the start: the end is the useful part.
+      const enc = new TextEncoder();
+      let size = 0;
+      let keepFrom = lines.length;
+      while (keepFrom > 0) {
+        const cost = enc.encode(lines[keepFrom - 1]).length + 1;
+        if (size + cost > maxBytes && keepFrom < lines.length) break;
+        size += cost;
+        keepFrom--;
+        if (size > maxBytes) break; // a single line over the ceiling: keep it, cut below
+      }
+      lines = lines.slice(keepFrom);
+      let body = lines.join("\n");
+      if (enc.encode(body).length > maxBytes) body = `… [line cut] ${body.slice(-maxBytes)}`;
+
+      const cut = lines.length < candidates;
+      header +=
+        `Log: ${raw.length} characters, ${allLines.length} lines. Section: ${sectionName}, ${section.length} lines` +
+        (pattern ? `, ${matched} matching /${args.grep}/i` : "") +
+        `. Showing ${cut ? `the last ${lines.length}` : `all ${lines.length}`}${pattern ? " matches" : " lines"}.\n`;
+      if (cut || section.length < allLines.length || pattern) {
+        header +=
+          `For more: raise tail_lines/max_bytes, pass step='all'${pattern ? ", drop grep" : ", or narrow with grep"}. ` +
+          `Full log (pre-authorized, expires in about a minute): ${logUrl}\n`;
+      }
+      return `${header}\n${body || "(no lines)"}`;
+    }
+
+    case "list_run_artifacts": {
+      const t = resolveActionsTarget(args);
+      const { owner, repo } = t;
+      if (!t.runId && t.jobId) {
+        const job = await gh(env, `/repos/${owner}/${repo}/actions/jobs/${t.jobId}`);
+        t.runId = String(job.run_id);
+      }
+      if (!t.runId) throw new Error("Pass run_id (from list_workflow_runs) or an Actions run URL as url.");
+      let data;
+      try {
+        data = await gh(env, `/repos/${owner}/${repo}/actions/runs/${t.runId}/artifacts?per_page=100`);
+      } catch (err) {
+        if (err.status === 404) throw new Error(`No run ${t.runId} in ${owner}/${repo} (404). ${ACTIONS_ACCESS_HINT}`);
+        throw err;
+      }
+      const artifacts = data.artifacts || [];
+      if (!artifacts.length) return `Run ${t.runId} in ${owner}/${repo} uploaded no artifacts.`;
+
+      const urls = new Map();
+      const live = artifacts.filter((a) => !a.expired);
+      if (args.download_urls !== false) {
+        await Promise.all(
+          live.slice(0, ARTIFACT_URL_MAX).map(async (a) => {
+            try {
+              urls.set(a.id, await ghRedirectUrl(env, `/repos/${owner}/${repo}/actions/artifacts/${a.id}/zip`));
+            } catch (err) {
+              urls.set(a.id, `(no download URL — ${err.message})`);
+            }
+          }),
+        );
+      }
+      let out = `${artifacts.length} artifact(s) from run ${t.runId} in ${owner}/${repo}:\n`;
+      for (const a of artifacts) {
+        out +=
+          `\n${a.id} ${a.name} — ${a.size_in_bytes} bytes (zip)` +
+          (a.expired ? " [expired]" : `, expires ${a.expires_at}`) +
+          `\n`;
+        if (urls.has(a.id)) out += `    ${urls.get(a.id)}\n`;
+      }
+      if (urls.size) out += `\nDownload URLs are pre-authorized and expire in about a minute; each is a zip of the artifact.`;
+      if (args.download_urls !== false && live.length > ARTIFACT_URL_MAX) {
+        out += `\nOnly the first ${ARTIFACT_URL_MAX} artifacts got a download URL.`;
+      }
+      if ((data.total_count || artifacts.length) > artifacts.length) {
+        out += `\nOnly the first ${artifacts.length} of ${data.total_count} artifacts are listed.`;
+      }
+      return out;
     }
 
     case "get_project": {

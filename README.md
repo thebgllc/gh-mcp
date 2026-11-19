@@ -21,7 +21,7 @@ sent anywhere except GitHub's API.
 
 ## What it does
 
-Exposes 28 tools over MCP:
+Exposes 31 tools over MCP:
 
 - **Files:** `get_file`, `push_file`, `delete_file`
 - **Repos:** `get_repo`, `list_repos`, `create_repo`, `create_branch`, `list_branches`
@@ -29,6 +29,7 @@ Exposes 28 tools over MCP:
 - **PRs:** `list_prs`, `get_pr`, `create_pr`, `merge_pr`
 - **History/search:** `list_commits`, `get_commit`, `search_code`, `search_issues`
 - **Actions/cost:** `list_workflows`, `list_workflow_runs`, `get_actions_billing`
+- **Actions failures:** `get_workflow_run`, `get_job_logs`, `list_run_artifacts`
 - **Projects:** `get_project`, `list_project_items`, `add_project_item`, `update_project_item_field`
 
 All calls go straight to the GitHub REST API using a Personal Access Token you
@@ -187,6 +188,26 @@ For the URL token specifically:
   [Rotating credentials](#rotating-credentials)). If you think the PAT itself
   leaked, revoke it on GitHub as well.
 
+## Why a run failed
+
+`list_workflow_runs` says a run failed; these three say why, without leaving
+chat. Each takes owner/repo plus an id, or just an Actions URL (run, job or
+attempt), so a CI-failure issue can go straight to its run.
+
+- `get_workflow_run`: head SHA, event, branch, conclusion and timings, every
+  job with its failed step(s), and the check-run annotations of the failed
+  jobs (file, line, message). Annotations are often enough to name a failing
+  test.
+- `get_job_logs`: the job's plain-text log, cut down to the failed step's own
+  lines (step boundaries come from the log's `##[group]Run` headers, since step
+  times are only to the second), then to the last 150 lines / 50 KB, with
+  timestamps and colour codes removed. `grep` filters lines by regex,
+  `step` picks another step or `all`, and when anything is cut the response
+  carries a short-lived pre-authorized URL to the full log. Given only a run,
+  it reads the run's failed job when there is exactly one.
+- `list_run_artifacts`: the run's uploaded artifacts (Playwright reports,
+  traces), each with a pre-authorized zip URL that expires in about a minute.
+
 ## Setup
 
 1. **Create a GitHub PAT** — the token the tools call GitHub with.
@@ -196,7 +217,8 @@ For the URL token specifically:
    read-only if that's all you need). Contents write also covers
    `delete_file`.
 
-   For the Actions/cost tools, add Actions **read**, plus account permission
+   For the Actions tools, add Actions **read** (plus Checks **read** for the
+   annotations in `get_workflow_run`), and for billing add account permission
    Plan **read** (user billing) or the organization's billing read (org
    billing). For the Projects tools, add account permission Projects **read
    and write**.
